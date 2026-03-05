@@ -1,4 +1,4 @@
-const { useCallback, useEffect, useMemo, useState } = React;
+const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 const WIDTH = 10;
 const HEIGHT = 20;
@@ -45,6 +45,55 @@ const COLORS = {
 };
 
 const SHAPE_KEYS = Object.keys(SHAPES);
+const LEADERBOARD_KEY = "tetrisLeaderboardV1";
+const LEADERBOARD_LIMIT = 10;
+const MELODY = [261.63, 329.63, 392.0, 329.63, 293.66, 349.23, 440.0, 349.23];
+const PLAYER_NAME_KEY = "tetrisPlayerNameV1";
+
+function loadLeaderboard() {
+  try {
+    const raw = localStorage.getItem(LEADERBOARD_KEY);
+    if (!raw) return [];
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter(
+        (entry) =>
+          Number.isFinite(entry?.score) &&
+          Number.isFinite(entry?.lines) &&
+          Number.isFinite(entry?.level) &&
+          typeof entry?.date === "string",
+      )
+      .map((entry) => ({
+        ...entry,
+        name: typeof entry?.name === "string" && entry.name.trim() ? entry.name.trim() : "Player",
+      }))
+      .slice(0, LEADERBOARD_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function saveLeaderboard(list) {
+  try {
+    localStorage.setItem(LEADERBOARD_KEY, JSON.stringify(list));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function loadPlayerName() {
+  try {
+    const raw = localStorage.getItem(PLAYER_NAME_KEY);
+    if (typeof raw !== "string") return "Player";
+    const trimmed = raw.trim();
+    return trimmed || "Player";
+  } catch {
+    return "Player";
+  }
+}
 
 function createEmptyBoard() {
   return Array.from({ length: HEIGHT }, () => Array(WIDTH).fill(EMPTY));
@@ -126,6 +175,95 @@ function Tetris() {
   const [level, setLevel] = useState(1);
   const [isGameOver, setIsGameOver] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [leaderboard, setLeaderboard] = useState(() => loadLeaderboard());
+  const [playerName, setPlayerName] = useState(() => loadPlayerName());
+
+  const audioContextRef = useRef(null);
+  const melodyTimerRef = useRef(null);
+  const melodyIndexRef = useRef(0);
+  const hasSavedScoreRef = useRef(false);
+
+  const ensureAudioContext = useCallback(() => {
+    if (audioContextRef.current) return audioContextRef.current;
+    const AudioContextImpl = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextImpl) return null;
+
+    const ctx = new AudioContextImpl();
+    audioContextRef.current = ctx;
+    return ctx;
+  }, []);
+
+  const unlockAudio = useCallback(() => {
+    const ctx = ensureAudioContext();
+    if (ctx?.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+  }, [ensureAudioContext]);
+
+  const playTone = useCallback(
+    (frequency, duration = 0.08, type = "square", volume = 0.04, delay = 0) => {
+      if (!soundEnabled) return;
+
+      const ctx = ensureAudioContext();
+      if (!ctx || ctx.state !== "running") return;
+
+      const now = ctx.currentTime + delay;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = type;
+      osc.frequency.setValueAtTime(frequency, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(volume, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration + 0.02);
+    },
+    [ensureAudioContext, soundEnabled],
+  );
+
+  const playSfx = useCallback(
+    (name) => {
+      switch (name) {
+        case "rotate":
+          playTone(420, 0.06, "triangle", 0.03);
+          break;
+        case "lock":
+          playTone(170, 0.06, "square", 0.05);
+          break;
+        case "line":
+          playTone(659.25, 0.08, "triangle", 0.05);
+          playTone(783.99, 0.1, "triangle", 0.05, 0.05);
+          break;
+        case "hardDrop":
+          playTone(220, 0.05, "sawtooth", 0.03);
+          playTone(120, 0.07, "sawtooth", 0.03, 0.04);
+          break;
+        case "pause":
+          playTone(250, 0.08, "square", 0.03);
+          break;
+        case "resume":
+          playTone(440, 0.08, "square", 0.03);
+          break;
+        case "restart":
+          playTone(392, 0.06, "triangle", 0.03);
+          playTone(523.25, 0.09, "triangle", 0.03, 0.05);
+          break;
+        case "gameOver":
+          playTone(220, 0.1, "sawtooth", 0.04);
+          playTone(164.81, 0.12, "sawtooth", 0.04, 0.09);
+          playTone(130.81, 0.16, "sawtooth", 0.04, 0.2);
+          break;
+        default:
+          break;
+      }
+    },
+    [playTone],
+  );
 
   const spawnPiece = useCallback(
     (updatedBoard) => {
@@ -140,20 +278,23 @@ function Tetris() {
       setNextPiece(freshNext);
       if (collides(updatedBoard, centered)) {
         setIsGameOver(true);
+        playSfx("gameOver");
         return;
       }
       setCurrentPiece(centered);
     },
-    [nextPiece],
+    [nextPiece, playSfx],
   );
 
   const lockPiece = useCallback(
     (pieceToLock) => {
+      playSfx("lock");
       setBoard((prevBoard) => {
         const merged = mergePiece(prevBoard, pieceToLock);
         const { board: clearedBoard, cleared } = clearLines(merged);
 
         if (cleared > 0) {
+          playSfx("line");
           const pointsByLines = [0, 100, 300, 500, 800];
           setScore((prev) => prev + pointsByLines[cleared] * level);
           setLines((prev) => {
@@ -168,7 +309,7 @@ function Tetris() {
         return clearedBoard;
       });
     },
-    [level, spawnPiece],
+    [level, playSfx, spawnPiece],
   );
 
   const movePiece = useCallback(
@@ -196,10 +337,11 @@ function Tetris() {
       const test = { ...rotated, x: rotated.x + kicks[i] };
       if (!collides(board, test)) {
         setCurrentPiece(test);
+        playSfx("rotate");
         return;
       }
     }
-  }, [board, currentPiece, isGameOver, isPaused]);
+  }, [board, currentPiece, isGameOver, isPaused, playSfx]);
 
   const hardDrop = useCallback(() => {
     if (isPaused || isGameOver) return;
@@ -208,8 +350,18 @@ function Tetris() {
     while (!collides(board, { ...dropped, y: dropped.y + 1 })) {
       dropped = { ...dropped, y: dropped.y + 1 };
     }
+    playSfx("hardDrop");
     lockPiece(dropped);
-  }, [board, currentPiece, isGameOver, isPaused, lockPiece]);
+  }, [board, currentPiece, isGameOver, isPaused, lockPiece, playSfx]);
+
+  const togglePause = useCallback(() => {
+    if (isGameOver) return;
+    setIsPaused((prev) => {
+      const next = !prev;
+      playSfx(next ? "pause" : "resume");
+      return next;
+    });
+  }, [isGameOver, playSfx]);
 
   const resetGame = useCallback(() => {
     setBoard(createEmptyBoard());
@@ -220,11 +372,15 @@ function Tetris() {
     setLevel(1);
     setIsGameOver(false);
     setIsPaused(false);
-  }, []);
+    hasSavedScoreRef.current = false;
+    melodyIndexRef.current = 0;
+    playSfx("restart");
+  }, [playSfx]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
       if (event.repeat) return;
+      unlockAudio();
 
       switch (event.code) {
         case "ArrowLeft":
@@ -249,7 +405,7 @@ function Tetris() {
           break;
         case "KeyP":
           event.preventDefault();
-          setIsPaused((prev) => !prev);
+          togglePause();
           break;
         case "KeyR":
           event.preventDefault();
@@ -262,13 +418,69 @@ function Tetris() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [hardDrop, movePiece, resetGame, rotatePiece]);
+  }, [hardDrop, movePiece, resetGame, rotatePiece, togglePause, unlockAudio]);
 
   useEffect(() => {
     if (isPaused || isGameOver) return undefined;
     const timer = setInterval(() => movePiece(0, 1), getDropSpeed(level));
     return () => clearInterval(timer);
   }, [isPaused, isGameOver, level, movePiece]);
+
+  useEffect(() => {
+    if (melodyTimerRef.current) clearTimeout(melodyTimerRef.current);
+
+    if (isPaused || isGameOver || !soundEnabled || !audioContextRef.current) return undefined;
+
+    const playNext = () => {
+      if (isPaused || isGameOver || !soundEnabled) return;
+      const note = MELODY[melodyIndexRef.current % MELODY.length];
+      melodyIndexRef.current += 1;
+      playTone(note, 0.18, "triangle", 0.018);
+      melodyTimerRef.current = setTimeout(playNext, 260);
+    };
+
+    melodyTimerRef.current = setTimeout(playNext, 100);
+
+    return () => {
+      if (melodyTimerRef.current) clearTimeout(melodyTimerRef.current);
+    };
+  }, [isGameOver, isPaused, playTone, soundEnabled]);
+
+  useEffect(
+    () => () => {
+      if (melodyTimerRef.current) clearTimeout(melodyTimerRef.current);
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!isGameOver || score <= 0 || hasSavedScoreRef.current) return;
+
+    setLeaderboard((prev) => {
+      const safeName = playerName.trim() || "Player";
+      const next = [
+        ...prev,
+        { name: safeName, score, lines, level, date: new Date().toISOString() },
+      ]
+        .sort((a, b) => b.score - a.score || b.lines - a.lines)
+        .slice(0, LEADERBOARD_LIMIT);
+      saveLeaderboard(next);
+      return next;
+    });
+
+    hasSavedScoreRef.current = true;
+  }, [isGameOver, level, lines, playerName, score]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PLAYER_NAME_KEY, playerName.trim() || "Player");
+    } catch {
+      // ignore storage errors
+    }
+  }, [playerName]);
 
   const displayBoard = useMemo(() => {
     const merged = board.map((row) => [...row]);
@@ -344,6 +556,66 @@ function Tetris() {
         <div style={{ marginBottom: "8px" }}>Lines: {lines}</div>
         <div style={{ marginBottom: "14px" }}>Level: {level}</div>
 
+        <div style={{ marginBottom: "8px", color: "var(--muted)" }}>Player name:</div>
+        <input
+          type="text"
+          value={playerName}
+          onChange={(event) => setPlayerName(event.target.value.slice(0, 20))}
+          placeholder="Enter name"
+          style={{
+            width: "100%",
+            marginBottom: "12px",
+            border: "1px solid #334155",
+            borderRadius: "8px",
+            background: "#0b1220",
+            color: "var(--text)",
+            padding: "8px 10px",
+            outline: "none",
+          }}
+        />
+
+        <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
+          <button
+            type="button"
+            onClick={() => {
+              unlockAudio();
+              togglePause();
+            }}
+            style={{
+              cursor: isGameOver ? "not-allowed" : "pointer",
+              border: "none",
+              background: isPaused ? "#16a34a" : "#f59e0b",
+              color: "white",
+              padding: "8px 10px",
+              borderRadius: "8px",
+              fontWeight: 600,
+              opacity: isGameOver ? 0.6 : 1,
+            }}
+            disabled={isGameOver}
+          >
+            {isPaused ? "Resume" : "Pause"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              unlockAudio();
+              setSoundEnabled((prev) => !prev);
+            }}
+            style={{
+              cursor: "pointer",
+              border: "1px solid #334155",
+              background: soundEnabled ? "#0f766e" : "#475569",
+              color: "white",
+              padding: "8px 10px",
+              borderRadius: "8px",
+              fontWeight: 600,
+            }}
+          >
+            {soundEnabled ? "Sound: on" : "Sound: off"}
+          </button>
+        </div>
+
         <div style={{ marginBottom: "10px", color: "var(--muted)" }}>Next piece:</div>
         <div
           style={{
@@ -378,9 +650,35 @@ function Tetris() {
         {isGameOver ? <div style={{ color: "#f87171", marginBottom: "10px" }}>Game over</div> : null}
         {isPaused ? <div style={{ color: "#fbbf24", marginBottom: "10px" }}>Paused</div> : null}
 
+        <div style={{ marginBottom: "10px", color: "var(--muted)" }}>Leaderboard:</div>
+        <div
+          style={{
+            border: "1px solid #334155",
+            borderRadius: "8px",
+            padding: "8px",
+            marginBottom: "14px",
+            maxHeight: "180px",
+            overflow: "auto",
+            fontSize: "13px",
+          }}
+        >
+          {leaderboard.length === 0 ? (
+            <div style={{ color: "var(--muted)" }}>No records yet</div>
+          ) : (
+            leaderboard.map((entry, index) => (
+              <div key={`${entry.date}-${entry.score}-${index}`} style={{ marginBottom: "6px" }}>
+                #{index + 1} - {entry.name}: {entry.score} pts (L{entry.level}, {entry.lines} lines)
+              </div>
+            ))
+          )}
+        </div>
+
         <button
           type="button"
-          onClick={resetGame}
+          onClick={() => {
+            unlockAudio();
+            resetGame();
+          }}
           style={{
             cursor: "pointer",
             border: "none",
